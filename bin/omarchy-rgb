@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""Drive RGB devices with effects colored by the current Omarchy theme.
+
+Usage:
+  omarchy-rgb                      Show the current effect
+  omarchy-rgb effect EFFECT        Switch effect: static, pulse, wave, manual or off
+  omarchy-rgb status               Effect, colors and devices as JSON
+  omarchy-rgb daemon               Run the effect loop (started by the plugin)
+
+static, pulse and wave follow the theme. manual stops sending colors, so ones
+set in the OpenRGB app (or the devices' own lighting) take over; off is dark.
+
+Talks to an OpenRGB SDK server on 127.0.0.1:6742 (also started by the plugin)
+using only the standard library. static and pulse use the theme's keyboard.rgb,
+falling back to its accent color; wave uses the theme colors around its accent
+plus its keyboard.rgb, swept across each device's physical layout. The daemon
+picks up theme
+and effect changes on its own. Corsair VOID headsets, which OpenRGB doesn't
+support yet, are driven directly over hidraw.
+"""
+
+import colorsys
+import fcntl
+import json
+import math
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+from pathlib import Path
+
+HOST, PORT = "127.0.0.1", 6742
+PROTOCOL = 5
+CLIENT_NAME = b"omarchy-rgb\0"
+
+THEME = Path.home() / ".local/state/omarchy/current/theme"
+STATE = Path.home() / ".local/state/omarchy/rgb-effect"
+STATUS = Path.home() / ".local/state/omarchy/rgb-status.json"
+LOCK = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-rgb.lock"
+# static, pulse and wave follow the theme. manual leaves devices alone so
+# colors set in the OpenRGB app (or the devices' own lighting) stay; off is dark.
+EFFECTS = ("static", "pulse", "wave", "manual", "off")
+DEFAULT_EFFECT = "static"
+
+FPS = 30
+PULSE_PERIOD = 4.0      # seconds per breath
+PULSE_FLOOR = 0.15      # dimmest point of a breath
+WAVE_PERIOD = 6.0       # seconds for the palette to sweep past a point
+WAVE_HUE_RANGE = 1 / 6  # theme colors within 60 degrees of the main color
+LED_SATURATION = 1.0    # minimum saturation for wave colors (1.0 = pure hues)
+STATIC_REFRESH = 2.0    # resend static colors to cover replugged devices
+
+PKT_CONTROLLER_COUNT = 0
+PKT_CONTROLLER_DATA = 1
+PKT_PROTOCOL_VERSION = 40
+PKT_SET_CLIENT_NAME = 50
+PKT_DEVICE_LIST_UPDATED = 100
+PKT_REQUEST_RESCAN = 140
+PKT_UPDATE_LEDS = 1050
+PKT_SET_CUSTOM_MODE = 1100
+
+NO_LED = 0xFFFFFFFF
+
+# OpenRGB device_type values (RGBController.h) for the status shown in the panel.
+DEVICE_TYPES = {0: "motherboard", 1: "memory", 2: "gpu", 3: "cooler", 4: "ledstrip",
+                5: "keyboard", 6: "mouse", 7: "mousemat", 8: "headset",
+                9: "headset-stand", 10: "gamepad", 11: "light", 12: "speaker",
+                14: "storage", 15: "case", 16: "microphone", 18: "keypad",
+                19: "laptop", 20: "monitor"}
+
+# Corsair VOID wireless receivers using the C8/CB lighting protocol (SignalRGB
+# covers these with one plugin; only 0x0A1A has been tested here).
+VOID_PIDS = {0x0A14, 0x0A16, 0x0A17, 0x0A1A, 0x0A1D}
+HEADSET_SCAN = 5.0      # seconds between hotplug scans / take-control resends
+
+
+# Theme colors
+
+def hex_rgb(value):
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def theme_colors():
+    try:
+        text = (THEME / "colors.toml").read_text()
+    except OSError:
+        return {}
+    return {k: v.lower() for k, v in re.findall(r'^(\w+)\s*=\s*"#([0-9A-Fa-f]{6})"', text, re.M)}
+
+
+def keyboard_color():
+    """The theme's own keyboard color (keyboard.rgb), or None if it has none."""
+    try:
+        value = (THEME / "keyboard.rgb").read_text().strip().lstrip("#")
+    except OSError:
+        return None
+    return hex_rgb(value.lower()) if re.fullmatch(r"[0-9A-Fa-f]{6}", value) else None
+
+
+def led_color(rgb):
+    """Theme colors are tuned as text on a dark background; LEDs show pastels
+    washed out. Keep the hue but push saturation and brightness up."""
+    h, s, v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
+    if s < 0.12:
+        return rgb                      # grey/white: nothing to saturate
+    r, g, b = colorsys.hsv_to_rgb(h, max(s, LED_SATURATION), 1.0)
+    return (round(r * 255), round(g * 255), round(b * 255))
+
+
+def hue_distance(a, b):
+    return min(abs(a - b), 1 - abs(a - b))
+
+
+def hue(rgb):
+    return colorsys.rgb_to_hsv(*(c / 255 for c in rgb))[0]
+
+
+def wave_palette(colors, center, keyboard=None):
+    """Colors around center (the theme accent): every saturated theme color within
+    WAVE_HUE_RANGE of its hue, plus the theme's keyboard color if it has one,
+    ordered by hue and made LED-friendly. The full terminal palette spans every
+    hue, so using all of it reads as a generic rainbow rather than the theme."""
+    skip = ("background", "foreground", "selection", "muted", "cursor", "brown")
+    center_s = colorsys.rgb_to_hsv(*(c / 255 for c in center))[1]
+    if center_s < 0.12:
+        # Monochrome accent: build around the keyboard color if there is one,
+        # otherwise sweep between the accent and a dim shade of it.
+        if keyboard is None:
+            return [center, scale(center, 0.25)]
+        center, keyboard = keyboard, None
+    center_h = hue(center)
+
+    picked = [led_color(center)]
+
+    def add(rgb):
+        candidate = led_color(rgb)
+        if all(hue_distance(hue(candidate), hue(p)) > 0.03 for p in picked):
+            picked.append(candidate)
+
+    for name, value in colors.items():
+        if any(s in name for s in skip):
+            continue
+        h, s, v = colorsys.rgb_to_hsv(*(c / 255 for c in hex_rgb(value)))
+        if s < 0.25 or v < 0.3 or hue_distance(h, center_h) > WAVE_HUE_RANGE:
+            continue
+        add(hex_rgb(value))
+    if keyboard is not None:
+        add(keyboard)
+
+    # Order by hue relative to center so the gradient doesn't jump
+    # across the red/violet wrap-around, then bounce back so it loops smoothly.
+    def offset(rgb):
+        return (hue(rgb) - center_h + 0.5) % 1.0 - 0.5
+    picked.sort(key=offset)
+    if len(picked) < 2:
+        return [picked[0], scale(picked[0], 0.35)]
+    return picked + picked[-2:0:-1]
+
+
+# Color math
+
+def scale(rgb, factor):
+    return tuple(round(c * factor) for c in rgb)
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def sample(palette, u):
+    """Sample a cyclic gradient through palette at u in [0, 1)."""
+    pos = (u % 1.0) * len(palette)
+    i = int(pos)
+    return mix(palette[i], palette[(i + 1) % len(palette)], pos - i)
+
+
+# OpenRGB SDK client
+
+class Reader:
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def take(self, fmt):
+        values = struct.unpack_from("<" + fmt, self.data, self.pos)
+        self.pos += struct.calcsize("<" + fmt)
+        return values if len(values) > 1 else values[0]
+
+    def array(self, count, fmt="I"):
+        values = struct.unpack_from(f"<{count}{fmt}", self.data, self.pos)
+        self.pos += struct.calcsize(f"<{count}{fmt}")
+        return values
+
+    def string(self):
+        n = self.take("H")
+        value = self.data[self.pos:self.pos + n].rstrip(b"\0").decode(errors="replace")
+        self.pos += n
+        return value
+
+
+class Device:
+    def __init__(self, index, data, version):
+        r = Reader(data)
+        r.take("I")                                 # data size
+        self.type = DEVICE_TYPES.get(r.take("i"), "device")
+        self.name = r.string()
+        if version >= 1:
+            r.string()                              # vendor
+        for _ in range(4):
+            r.string()                              # description, version, serial, location
+        mode_count = r.take("H")
+        r.take("i")                                 # active mode
+        for _ in range(mode_count):
+            r.string()
+            r.take("iIII")                          # value, flags, speed min/max
+            if version >= 3:
+                r.take("II")                        # brightness min/max
+            r.take("III")                           # colors min/max, speed
+            if version >= 3:
+                r.take("I")                         # brightness
+            r.take("II")                            # direction, color mode
+            r.array(r.take("H"))                    # mode colors
+        self.positions = []
+        for _ in range(r.take("H")):                # zones
+            r.string()
+            zone_type, _, _, count = r.take("iIII")
+            start = len(self.positions)
+            zone = [(i / max(count - 1, 1), 0.5) for i in range(count)]
+            if r.take("H"):
+                height, width = r.take("II")
+                for cell, led in enumerate(r.array(height * width)):
+                    if led != NO_LED and led < count:
+                        row, col = divmod(cell, width)
+                        zone[led] = (col / max(width - 1, 1), row / max(height - 1, 1))
+            if version >= 4:
+                for _ in range(r.take("H")):        # segments
+                    r.string()
+                    r.take("iII")
+            if version >= 5:
+                r.take("I")                         # zone flags
+            self.positions.extend(zone)
+        self.index = index
+        self.led_count = r.take("H")
+        # Zones normally account for every LED; pad if a device reports extras.
+        while len(self.positions) < self.led_count:
+            self.positions.append((0.5, 0.5))
+        del self.positions[self.led_count:]
+
+
+class Client:
+    def __init__(self):
+        self.sock = socket.create_connection((HOST, PORT), timeout=5)
+        self.send(0, PKT_PROTOCOL_VERSION, struct.pack("<I", PROTOCOL))
+        server = struct.unpack("<I", self.recv(PKT_PROTOCOL_VERSION))[0]
+        self.version = min(server, PROTOCOL)
+        self.send(0, PKT_SET_CLIENT_NAME, CLIENT_NAME)
+        self.devices_changed = False
+
+    def close(self):
+        self.sock.close()
+
+    def send(self, device, packet, data=b""):
+        self.sock.sendall(b"ORGB" + struct.pack("<III", device, packet, len(data)) + data)
+
+    def read_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("OpenRGB server closed the connection")
+            buf += chunk
+        return buf
+
+    def read_packet(self):
+        header = self.read_exact(16)
+        if header[:4] != b"ORGB":
+            raise ConnectionError("bad packet from OpenRGB server")
+        _, packet, size = struct.unpack("<III", header[4:])
+        data = self.read_exact(size)
+        if packet == PKT_DEVICE_LIST_UPDATED:
+            self.devices_changed = True
+        return packet, data
+
+    def recv(self, want):
+        while True:
+            packet, data = self.read_packet()
+            if packet == want:
+                return data
+
+    def drain(self):
+        """Consume unsolicited packets so the server never blocks on us."""
+        while select.select([self.sock], [], [], 0)[0]:
+            self.read_packet()
+
+    def devices(self):
+        self.send(0, PKT_CONTROLLER_COUNT)
+        count = struct.unpack("<I", self.recv(PKT_CONTROLLER_COUNT))[0]
+        devices = []
+        for i in range(count):
+            self.send(i, PKT_CONTROLLER_DATA, struct.pack("<I", self.version))
+            devices.append(Device(i, self.recv(PKT_CONTROLLER_DATA), self.version))
+            self.send(i, PKT_SET_CUSTOM_MODE)
+        self.devices_changed = False
+        return devices
+
+    def rescan(self):
+        """Ask the server to detect devices again; it announces the new list
+        with a device-list-updated packet."""
+        self.send(0, PKT_REQUEST_RESCAN)
+
+    def update(self, device, colors):
+        payload = b"".join(struct.pack("<I", r | g << 8 | b << 16) for r, g, b in colors)
+        size = 4 + 2 + len(payload)
+        self.send(device.index, PKT_UPDATE_LEDS, struct.pack("<IH", size, len(colors)) + payload)
+
+
+# Corsair VOID headsets
+
+class Headset:
+    """A Corsair VOID-family wireless headset, driven directly over hidraw since
+    OpenRGB has no driver for it yet. Protocol from SignalRGB's VOID PRO plugin
+    and OpenRGB draft MR !1079, confirmed on a VOID PRO Wireless (1b1c:0a1a):
+
+      C8 01 / C8 00   take lighting from the firmware / hand it back (the mic
+                      mute LED only works while the firmware has it)
+      CB 06 1C r 16 g 17 b 1D r 18 g 19 b
+                      set the left and right earcup colors (register pairs)
+    """
+
+    led_count = 2
+    positions = [(0.0, 0.5), (0.5, 0.5)]    # earcups half a wave apart
+    type = "headset"
+    name = "Corsair VOID headset"
+
+    def __init__(self, path):
+        self.file = open(path, "wb", buffering=0)
+        self.controlled = False
+
+    def take_control(self):
+        self.file.write(bytes([0xC8, 0x01, 0x00]))
+        self.controlled = True
+
+    def hand_back(self):
+        if self.controlled:
+            self.file.write(bytes([0xC8, 0x00, 0x00]))
+            self.controlled = False
+
+    def update(self, colors):
+        (lr, lg, lb), (rr, rg, rb) = colors
+        self.file.write(bytes([0xCB, 0x06, 0x1C, lr, 0x16, lg, 0x17, lb,
+                               0x1D, rr, 0x18, rg, 0x19, rb]) + bytes(6))
+
+    def release(self):
+        try:
+            self.hand_back()
+        except OSError:
+            pass
+        self.close()
+
+    def close(self):
+        try:
+            self.file.close()
+        except OSError:
+            pass
+
+
+def output_report_ids(descriptor):
+    """Report IDs of a HID report descriptor's Output items."""
+    ids, report_id, i = set(), None, 0
+    while i < len(descriptor):
+        prefix = descriptor[i]
+        if prefix == 0xFE:                          # long item
+            i += 3 + descriptor[i + 1]
+            continue
+        size = (0, 1, 2, 4)[prefix & 3]
+        value = int.from_bytes(descriptor[i + 1:i + 1 + size], "little")
+        if prefix & 0xFC == 0x84:                   # Report ID
+            report_id = value
+        elif prefix & 0xFC == 0x90:                 # Output
+            ids.add(report_id)
+        i += 1 + size
+    return ids
+
+
+def usb_hid_devices():
+    """The USB HID devices present, to notice plugging and unplugging. The
+    OpenRGB server doesn't hotplug, so it has to be told to rescan."""
+    found = set()
+    for node in Path("/sys/class/hidraw").glob("hidraw*"):
+        try:
+            uevent = (node / "device/uevent").read_text()
+        except OSError:
+            continue
+        match = re.search(r"^HID_ID=(0003:\S+)$", uevent, re.M)
+        if match:
+            found.add((node.name, match.group(1)))
+    return found
+
+
+def find_headsets():
+    """hidraw nodes of VOID headset receivers' lighting interfaces: the ones
+    that accept both the lights (0xC8) and register (0xCB) output reports."""
+    found = []
+    for node in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        try:
+            uevent = (node / "device/uevent").read_text()
+            descriptor = (node / "device/report_descriptor").read_bytes()
+        except OSError:
+            continue
+        match = re.search(r"^HID_ID=0003:00001B1C:0000([0-9A-F]{4})$", uevent, re.M)
+        if not match or int(match.group(1), 16) not in VOID_PIDS:
+            continue
+        if {0xC8, 0xCB} <= output_report_ids(descriptor):
+            found.append(f"/dev/{node.name}")
+    return found
+
+
+# Effects
+
+def read_effect():
+    try:
+        effect = STATE.read_text().strip()
+    except OSError:
+        effect = DEFAULT_EFFECT
+    return effect if effect in EFFECTS else DEFAULT_EFFECT
+
+
+def frame(effect, device, t, main, palette):
+    if effect == "off":
+        return [(0, 0, 0)] * device.led_count
+    if effect == "static":
+        return [main] * device.led_count
+    if effect == "pulse":
+        level = PULSE_FLOOR + (1 - PULSE_FLOOR) * (0.5 - 0.5 * math.cos(2 * math.pi * t / PULSE_PERIOD))
+        return [scale(main, level)] * device.led_count
+    shift = t / WAVE_PERIOD
+    return [sample(palette, x - shift) for x, _ in device.positions]
+
+
+def watched_files():
+    """Identify the theme and effect files, so a theme switch (which replaces
+    the theme directory) or an effect change is noticed without signals."""
+    signature = []
+    for path in (STATE, THEME / "colors.toml", THEME / "keyboard.rgb"):
+        try:
+            st = path.stat()
+            signature.append((st.st_ino, st.st_mtime_ns))
+        except OSError:
+            signature.append(None)
+    return signature
+
+
+def daemon_lock():
+    """Open and lock the daemon's lock file, or return None if another daemon
+    holds it. Kept open for the daemon's lifetime; the kernel drops the lock
+    when the process exits, however it exits."""
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
+def daemon():
+    lock = daemon_lock()
+    if lock is None:
+        sys.exit("omarchy-rgb: another daemon is already running")
+
+    running = True
+
+    def on_term(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    client, devices = None, []
+    headsets = {}
+    loaded = written = plugged = None
+    next_connect = next_poll = next_scan = 0.0
+    last_sent = last_checked = 0.0
+    start = time.monotonic()
+    try:
+        while running:
+            now = time.monotonic()
+
+            if now - last_checked >= 0.25:
+                last_checked = now
+                current = watched_files()
+                if current != loaded:
+                    loaded = current
+                    colors = theme_colors()
+                    accent = hex_rgb(colors.get("accent", "ffffff"))
+                    keyboard = keyboard_color()
+                    main = led_color(keyboard or accent)
+                    palette = wave_palette(colors, accent, keyboard)
+                    effect = read_effect()
+                    last_sent = 0.0
+                    if effect == "manual":
+                        # Headsets get their own lighting (and mic LED) back.
+                        for path, headset in list(headsets.items()):
+                            try:
+                                headset.hand_back()
+                            except OSError:
+                                headsets.pop(path).close()
+
+            if client is None and now >= next_connect:
+                try:
+                    client = Client()
+                    devices, next_poll = [], now
+                except OSError:
+                    client, next_connect = None, now + 3
+
+            if client is not None:
+                try:
+                    client.drain()
+                    if client.devices_changed:
+                        # Let the server finish detecting before re-listing.
+                        client.devices_changed, devices, next_poll = False, [], now + 2
+                    if not devices and now >= next_poll:
+                        devices, next_poll, last_sent = client.devices(), now + 2, 0.0
+                except (OSError, struct.error):
+                    client.close()
+                    client, devices, next_connect = None, [], now + 3
+
+            if now >= next_scan:
+                next_scan = now + HEADSET_SCAN
+                hid = usb_hid_devices()
+                if hid != plugged and plugged is not None and client is not None:
+                    try:
+                        client.rescan()
+                    except OSError:
+                        client.close()
+                        client, devices, next_connect = None, [], now + 3
+                plugged = hid
+                present = find_headsets()
+                for path in set(headsets) - set(present):
+                    headsets.pop(path).close()
+                for path in present:
+                    try:
+                        headset = headsets.setdefault(path, Headset(path))
+                        if effect != "manual":
+                            headset.take_control()
+                    except OSError:
+                        headsets.pop(path, None)
+                last_sent = 0.0
+
+            status = make_status(effect, main, palette, devices + list(headsets.values()))
+            if status != written:
+                written = status
+                write_status(status)
+
+            animated = effect in ("pulse", "wave")
+            if effect != "manual" and (animated or now - last_sent >= STATIC_REFRESH):
+                t = now - start
+                if client is not None:
+                    try:
+                        for device in devices:
+                            client.update(device, frame(effect, device, t, main, palette))
+                    except OSError:
+                        client.close()
+                        client, devices, next_connect = None, [], now + 3
+                for path, headset in list(headsets.items()):
+                    try:
+                        headset.update(frame(effect, headset, t, main, palette))
+                    except OSError:
+                        headsets.pop(path).close()
+                last_sent = now
+
+            time.sleep(1 / FPS if animated else 0.25)
+    finally:
+        for headset in headsets.values():
+            headset.release()
+        if client is not None:
+            client.close()
+        try:
+            STATUS.unlink()
+        except OSError:
+            pass
+
+
+# Status for the Omarchy panel
+
+def hex_str(rgb):
+    return "#%02x%02x%02x" % rgb
+
+
+def make_status(effect, main, palette, devices):
+    try:
+        theme = (THEME.parent / "theme.name").read_text().strip()
+    except OSError:
+        theme = ""
+    # The palette is stored bounced back on itself for a smooth loop; show
+    # each color once.
+    distinct = palette[:len(palette) // 2 + 1] if len(palette) > 2 else palette
+    return {
+        "effect": effect,
+        "theme": theme,
+        "color": hex_str(main),
+        "palette": [hex_str(c) for c in distinct],
+        "devices": [{"name": d.name, "type": d.type} for d in devices],
+    }
+
+
+def write_status(status):
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(status))
+    tmp.replace(STATUS)
+
+
+def print_status():
+    """Daemon status as one JSON object, for the Omarchy panel."""
+    lock = daemon_lock()
+    running = lock is None              # held by a running daemon
+    if lock is not None:
+        lock.close()
+    status = {}
+    if running:
+        try:
+            status = json.loads(STATUS.read_text())
+        except (OSError, ValueError):
+            pass
+    status.update({"running": running, "effect": read_effect()})
+    print(json.dumps(status))
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(read_effect())
+    elif args[0] == "effect" and len(args) == 2 and args[1] in EFFECTS:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(args[1] + "\n")
+    elif args == ["status"]:
+        print_status()
+    elif args == ["daemon"]:
+        daemon()
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

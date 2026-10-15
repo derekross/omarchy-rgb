@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "derekross.rgb",
+  "name": "RGB",
+  "version": "0.1.0",
+  "author": "Derek Ross",
+  "license": "MIT",
+  "description": "Theme-colored lighting for OpenRGB devices and Corsair VOID headsets: static, pulse or wave in your theme's colors, or hand control back to OpenRGB. Needs OpenRGB: omarchy pkg add openrgb.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "RGB",
+    "description": "Switch keyboard, mouse and headset lighting between theme effects and your own colors.",
+    "category": "System",
+    "aliases": [
+      "rgb",
+      "lighting",
+      "openrgb",
+      "keyboard"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
