@@ -31,9 +31,11 @@ Panel {
   readonly property string effect: status.effect || ""
   readonly property var devices: status.devices || []
   readonly property var palette: status.palette || []
+  readonly property var room: status.room || ({})
+  readonly property bool roomShown: running && (room.available === true || room.enabled === true)
 
   // Keyboard cursor across the action buttons, in reading order.
-  readonly property var actions: ["static", "pulse", "wave", "manual", "off", "openrgb"]
+  readonly property var actions: ["static", "pulse", "wave", "manual", "off", "openrgb", "room"]
   property int cursorIndex: 0
   property bool cursorActive: false
 
@@ -61,6 +63,7 @@ Panel {
     if (type === "keyboard") return "󰌌"
     if (type === "mouse") return "󰍽"
     if (type === "headset") return "󰋋"
+    if (type === "light") return "󰌵"
     return "󰛨"
   }
 
@@ -86,6 +89,21 @@ Panel {
     actionProc.running = true
   }
 
+  function toggleRoom() {
+    if (actionProc.running) return
+    actionProc.command = [root.tool, "room", "toggle"]
+    actionProc.running = true
+  }
+
+  function roomDetail() {
+    if (room.error) return room.error
+    var areas = (room.areas || []).join(", ")
+    if (!room.available) return "Hue Entertainment area not found"
+    if (!room.enabled) return "Match " + areas + " to the effect"
+    if (effect === "manual") return areas + " · back to its own colors"
+    return areas + " · following the effect"
+  }
+
   function openOpenRgb() {
     // The app connects to the running OpenRGB server; switch to manual first
     // so the daemon stops painting over whatever gets picked there.
@@ -97,12 +115,13 @@ Panel {
   function activate(index) {
     var action = actions[index]
     if (action === "openrgb") openOpenRgb()
+    else if (action === "room") toggleRoom()
     else setEffect(action)
   }
 
   function moveCursor(dx, dy) {
-    // Rows: [static pulse wave] [manual off] [openrgb]
-    var rows = [[0, 1, 2], [3, 4], [5]]
+    // Rows: [static pulse wave] [manual off] [openrgb] [room]
+    var rows = roomShown ? [[0, 1, 2], [3, 4], [5], [6]] : [[0, 1, 2], [3, 4], [5]]
     var row = 0, col = 0
     for (var r = 0; r < rows.length; r++) {
       var c = rows[r].indexOf(cursorIndex)
@@ -312,6 +331,31 @@ Panel {
             hasCursor: root.cursorActive && root.cursorIndex === 5
             onClicked: root.openOpenRgb()
             onHovered: function(h) { if (h) { root.cursorActive = true; root.cursorIndex = 5 } }
+          }
+        }
+
+        // ---------- Room lights ----------
+        Column {
+          visible: root.roomShown
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSectionHeader {
+            text: "ROOM"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
+
+          Toggle {
+            width: parent.width
+            label: "Room lights"
+            description: root.roomDetail()
+            checked: root.room.enabled === true
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            hasCursor: root.cursorActive && root.cursorIndex === 6
+            onClicked: root.toggleRoom()
+            onHovered: function(h) { if (h) { root.cursorActive = true; root.cursorIndex = 6 } }
           }
         }
 

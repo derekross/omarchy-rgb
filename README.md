@@ -41,8 +41,9 @@ omarchy plugin remove derekross.rgb
 Removing the plugin stops the daemon and the OpenRGB server it started, and
 headsets get their own lighting back. If you linked `omarchy-rgb` onto your
 PATH, delete the link with `rm ~/.local/bin/omarchy-rgb`. The daemon's state
-is in `~/.local/state/omarchy/rgb-effect` and `rgb-status.json`, and you can
-delete those too. OpenRGB itself stays installed.
+is in `~/.local/state/omarchy/`, in files starting with `rgb-`, and you can
+delete those too. Turn room sync off before removing the plugin, so your
+room lights get their own colors back. OpenRGB itself stays installed.
 
 ## Use
 
@@ -87,6 +88,35 @@ tested on a VOID PRO Wireless (`1b1c:0a1a`).
 
 The headset's mic mute LED stays off while the daemon controls the lighting. It
 comes back in Manual mode, or when the headset is switched off and on.
+
+## Room lights (Philips Hue)
+
+The effects can also light your room through a Hue Entertainment area. This
+is off by default, and the panel only shows a **Room lights** switch once
+OpenRGB has found an Entertainment area.
+
+1. In the Hue app, create an Entertainment area with the lights you want.
+2. Pair your bridge in OpenRGB with Entertainment mode on (Settings → Philips
+   Hue, or Manual Devices in newer versions). OpenRGB needs the bridge's IP
+   and MAC address, and you press the button on the bridge to pair.
+3. Restart the shell so the plugin's OpenRGB server picks up the bridge.
+
+From a terminal:
+
+```bash
+omarchy-rgb room on         # on, off or toggle
+```
+
+When room sync turns on, each light's current state is saved from the bridge
+to `~/.local/state/omarchy/rgb-room-snapshot.json`. When it turns off, or the
+panel switches to Manual, the stream ends and the lights are put back,
+because Hue lights otherwise keep the last streamed color. If the daemon
+stops unexpectedly, it puts the lights back the next time it starts.
+
+The daemon reads the bridge key from OpenRGB's settings and talks to the
+bridge over HTTPS without checking its self-signed certificate. OpenRGB
+already sends the same key over plain HTTP, so checking it wouldn't make the
+key any safer.
 
 ## How it works
 

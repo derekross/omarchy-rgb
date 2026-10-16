@@ -4,6 +4,7 @@
 Usage:
   omarchy-rgb                      Show the current effect
   omarchy-rgb effect EFFECT        Switch effect: static, pulse, wave, manual or off
+  omarchy-rgb room on|off|toggle   Include room lights (Philips Hue) in the effect
   omarchy-rgb status               Effect, colors and devices as JSON
   omarchy-rgb daemon               Run the effect loop (started by the plugin)
 
@@ -17,10 +18,16 @@ plus its keyboard.rgb, swept across each device's physical layout. The daemon
 picks up theme
 and effect changes on its own. Corsair VOID headsets, which OpenRGB doesn't
 support yet, are driven directly over hidraw.
+
+Room lights (Philips Hue Entertainment areas in OpenRGB) are only driven while
+room sync is on. Their colors are saved from the Hue bridge first and put back
+when sync turns off, since the lights keep the last streamed color otherwise.
 """
 
 import colorsys
 import fcntl
+import http.client
+import ipaddress
 import json
 import math
 import os
@@ -28,6 +35,7 @@ import re
 import select
 import signal
 import socket
+import ssl
 import struct
 import sys
 import tempfile
@@ -41,6 +49,9 @@ CLIENT_NAME = b"omarchy-rgb\0"
 THEME = Path.home() / ".local/state/omarchy/current/theme"
 STATE = Path.home() / ".local/state/omarchy/rgb-effect"
 STATUS = Path.home() / ".local/state/omarchy/rgb-status.json"
+ROOM = Path.home() / ".local/state/omarchy/rgb-room"
+ROOM_SNAPSHOT = Path.home() / ".local/state/omarchy/rgb-room-snapshot.json"
+OPENRGB_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "OpenRGB/OpenRGB.json"
 LOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or STATE.parent) / "omarchy-rgb.lock"
 # static, pulse and wave follow the theme. manual leaves devices alone so
 # colors set in the OpenRGB app (or the devices' own lighting) stay; off is dark.
@@ -63,8 +74,17 @@ PKT_DEVICE_LIST_UPDATED = 100
 PKT_REQUEST_RESCAN = 140
 PKT_UPDATE_LEDS = 1050
 PKT_SET_CUSTOM_MODE = 1100
+PKT_UPDATE_MODE = 1101
 
 NO_LED = 0xFFFFFFFF
+
+# Room lights light the room, not the desk, so they're only driven while room
+# sync is on. Only Hue Entertainment areas, which stream; OpenRGB's per-bulb Hue
+# devices go through a bridge that takes a few commands a second.
+ROOM_LIGHTS = ("Philips Hue",)
+ROOM_STREAMING = "Philips Hue Entertainment"
+ROOM_RETRY = 30.0       # seconds between attempts to put room lights back
+BRIDGE_MAX_BODY = 1 << 20
 
 # OpenRGB device_type values (RGBController.h) for the status shown in the panel.
 DEVICE_TYPES = {0: "motherboard", 1: "memory", 2: "gpu", 3: "cooler", 4: "ledstrip",
@@ -207,15 +227,20 @@ class Device:
         r = Reader(data)
         r.take("I")                                 # data size
         self.type = DEVICE_TYPES.get(r.take("i"), "device")
-        self.name = r.string()
+        self.name = r.string().strip()
         if version >= 1:
             r.string()                              # vendor
-        for _ in range(4):
-            r.string()                              # description, version, serial, location
+        self.description = r.string()
+        for _ in range(3):
+            r.string()                              # version, serial, location
         mode_count = r.take("H")
         r.take("i")                                 # active mode
-        for _ in range(mode_count):
-            r.string()
+        # Each mode's description is kept as sent, to select it by name with
+        # PKT_UPDATE_MODE, which takes the same layout back.
+        self.modes = {}
+        for mode_index in range(mode_count):
+            start = r.pos
+            mode_name = r.string()
             r.take("iIII")                          # value, flags, speed min/max
             if version >= 3:
                 r.take("II")                        # brightness min/max
@@ -224,6 +249,7 @@ class Device:
                 r.take("I")                         # brightness
             r.take("II")                            # direction, color mode
             r.array(r.take("H"))                    # mode colors
+            self.modes[mode_name] = (mode_index, data[start:r.pos])
         self.positions = []
         for _ in range(r.take("H")):                # zones
             r.string()
@@ -244,6 +270,7 @@ class Device:
                 r.take("I")                         # zone flags
             self.positions.extend(zone)
         self.index = index
+        self.room = self.description.startswith(ROOM_LIGHTS)
         self.led_count = r.take("H")
         # Zones normally account for every LED; pad if a device reports extras.
         while len(self.positions) < self.led_count:
@@ -302,10 +329,18 @@ class Client:
         devices = []
         for i in range(count):
             self.send(i, PKT_CONTROLLER_DATA, struct.pack("<I", self.version))
-            devices.append(Device(i, self.recv(PKT_CONTROLLER_DATA), self.version))
-            self.send(i, PKT_SET_CUSTOM_MODE)
+            device = Device(i, self.recv(PKT_CONTROLLER_DATA), self.version)
+            devices.append(device)
+            if not device.room:                     # room lights wait for room sync
+                self.send(i, PKT_SET_CUSTOM_MODE)
         self.devices_changed = False
         return devices
+
+    def set_mode(self, device, name):
+        """Select one of the device's modes by name."""
+        index, description = device.modes[name]
+        body = struct.pack("<i", index) + description
+        self.send(device.index, PKT_UPDATE_MODE, struct.pack("<I", 4 + len(body)) + body)
 
     def rescan(self):
         """Ask the server to detect devices again; it announces the new list
@@ -419,6 +454,178 @@ def find_headsets():
     return found
 
 
+# Room lights (Philips Hue)
+
+class RoomError(Exception):
+    pass
+
+
+class HueBridge:
+    """The Hue bridge OpenRGB is paired with, over its local REST API, to save
+    the room lights' colors before streaming and put them back after.
+
+    The bridge serves HTTPS with a self-signed certificate, so it isn't
+    verified. OpenRGB itself talks to the bridge over plain HTTP with the same
+    key, so verifying here wouldn't keep the key any more private."""
+
+    def __init__(self):
+        try:
+            config = json.loads(OPENRGB_CONFIG.read_text())
+            bridge = config["PhilipsHueDevices"]["bridges"][0]
+            self.ip = str(ipaddress.ip_address(bridge["ip"]))
+            self.username = bridge["username"]
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            raise RoomError("No Hue bridge is paired in OpenRGB")
+        if not isinstance(self.username, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", self.username):
+            raise RoomError("The Hue bridge key in OpenRGB's settings is invalid")
+        self.context = ssl.create_default_context()
+        self.context.check_hostname = False
+        self.context.verify_mode = ssl.CERT_NONE
+
+    def request(self, method, path, body=None):
+        conn = http.client.HTTPSConnection(self.ip, 443, timeout=5, context=self.context)
+        try:
+            conn.request(method, f"/api/{self.username}{path}",
+                         body=None if body is None else json.dumps(body),
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            data = response.read(BRIDGE_MAX_BODY + 1)
+        except (OSError, http.client.HTTPException) as e:
+            raise RoomError(f"Can't reach the Hue bridge: {e}")
+        finally:
+            conn.close()
+        if len(data) > BRIDGE_MAX_BODY:
+            raise RoomError("The Hue bridge sent an oversized reply")
+        try:
+            reply = json.loads(data)
+        except ValueError:
+            raise RoomError("The Hue bridge sent an invalid reply")
+        if isinstance(reply, list) and reply and isinstance(reply[0], dict) and "error" in reply[0]:
+            raise RoomError("The Hue bridge refused: " + str(reply[0]["error"].get("description", "")))
+        return reply
+
+    def area_lights(self, name):
+        """Light ids in the Entertainment area OpenRGB names name."""
+        groups = self.request("GET", "/groups")
+        for group in groups.values() if isinstance(groups, dict) else ():
+            if isinstance(group, dict) and group.get("type") == "Entertainment" and group.get("name") == name:
+                return [i for i in group.get("lights", []) if isinstance(i, str) and i.isdigit()]
+        raise RoomError(f"The Hue bridge has no Entertainment area named {name}")
+
+    def light_state(self, light):
+        state = self.request("GET", f"/lights/{light}").get("state", {})
+        saved = {"on": bool(state.get("on")), "bri": state.get("bri")}
+        mode = state.get("colormode")
+        if mode == "ct":
+            saved["ct"] = state.get("ct")
+        elif mode == "xy":
+            saved["xy"] = state.get("xy")
+        elif mode == "hs":
+            saved.update(hue=state.get("hue"), sat=state.get("sat"))
+        return {k: v for k, v in saved.items() if v is not None}
+
+    def set_light_state(self, light, state):
+        self.request("PUT", f"/lights/{light}/state", state)
+
+
+def room_enabled():
+    try:
+        return ROOM.read_text().strip() == "on"
+    except OSError:
+        return False
+
+
+def write_private_json(path, value):
+    """Write JSON through a unique temporary file, readable only by the user."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(value))
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+class RoomSync:
+    """Streams effects to Hue Entertainment areas while room sync is on.
+
+    The lights keep the last streamed color when a stream ends, and the bridge
+    doesn't report streamed colors, so each light's state is saved to
+    ROOM_SNAPSHOT before the first stream and put back when sync stops. The
+    snapshot outlives the daemon: one left behind by a crash is put back (or
+    reused, if sync is still on) rather than taken again from lights that may
+    still show streamed colors."""
+
+    def __init__(self):
+        self.active = {}            # device index -> Device, while streaming
+        self.error = ""
+        self.next_try = 0.0
+
+    @staticmethod
+    def areas(devices):
+        return [d for d in devices if d.description.startswith(ROOM_STREAMING)
+                and "Direct" in d.modes and "Disconnected" in d.modes]
+
+    def start(self, client, devices, now):
+        if now < self.next_try:
+            return
+        areas = self.areas(devices)
+        try:
+            if not ROOM_SNAPSHOT.exists():
+                bridge = HueBridge()
+                lights = {}
+                for area in areas:
+                    for light in bridge.area_lights(area.name):
+                        if light not in lights:
+                            lights[light] = bridge.light_state(light)
+                write_private_json(ROOM_SNAPSHOT, {"lights": lights})
+        except (RoomError, OSError) as e:
+            # Never stream without a way to put the lights back.
+            self.error, self.next_try = str(e), now + ROOM_RETRY
+            return
+        for area in areas:
+            client.set_mode(area, "Direct")
+            self.active[area.index] = area
+        self.error = ""
+
+    def stop(self, client):
+        if client is not None:
+            for area in self.active.values():
+                try:
+                    client.set_mode(area, "Disconnected")
+                except OSError:
+                    break
+            if self.active:
+                time.sleep(0.5)     # let the bridge end the stream first
+        self.active.clear()
+        self.restore()
+
+    def restore(self):
+        """Put the saved light states back; True once nothing is left to do."""
+        try:
+            saved = json.loads(ROOM_SNAPSHOT.read_text())
+        except FileNotFoundError:
+            return True
+        except (OSError, ValueError):
+            saved = {}
+        try:
+            lights = saved.get("lights", {}) if isinstance(saved, dict) else {}
+            if lights:
+                bridge = HueBridge()
+                for light, state in lights.items():
+                    if light.isdigit() and isinstance(state, dict):
+                        bridge.set_light_state(light, state)
+                        time.sleep(0.1)     # the bridge takes ~10 light commands a second
+            ROOM_SNAPSHOT.unlink(missing_ok=True)
+        except RoomError as e:
+            self.error, self.next_try = str(e), time.monotonic() + ROOM_RETRY
+            return False
+        self.error = ""
+        return True
+
+
 # Effects
 
 def read_effect():
@@ -445,7 +652,7 @@ def watched_files():
     """Identify the theme and effect files, so a theme switch (which replaces
     the theme directory) or an effect change is noticed without signals."""
     signature = []
-    for path in (STATE, THEME / "colors.toml", THEME / "keyboard.rgb"):
+    for path in (STATE, ROOM, THEME / "colors.toml", THEME / "keyboard.rgb"):
         try:
             st = path.stat()
             signature.append((st.st_ino, st.st_mtime_ns))
@@ -485,6 +692,7 @@ def daemon():
 
     client, devices = None, []
     headsets = {}
+    room = RoomSync()
     loaded = written = plugged = None
     next_connect = next_poll = next_scan = 0.0
     last_sent = last_checked = 0.0
@@ -504,6 +712,7 @@ def daemon():
                     main = led_color(keyboard or accent)
                     palette = wave_palette(colors, accent, keyboard)
                     effect = read_effect()
+                    room_on = room_enabled()
                     last_sent = 0.0
                     if effect == "manual":
                         # Headsets get their own lighting (and mic LED) back.
@@ -526,11 +735,13 @@ def daemon():
                     if client.devices_changed:
                         # Let the server finish detecting before re-listing.
                         client.devices_changed, devices, next_poll = False, [], now + 2
+                        room.active.clear()
                     if not devices and now >= next_poll:
                         devices, next_poll, last_sent = client.devices(), now + 2, 0.0
                 except (OSError, struct.error):
                     client.close()
                     client, devices, next_connect = None, [], now + 3
+                    room.active.clear()
 
             if now >= next_scan:
                 next_scan = now + HEADSET_SCAN
@@ -541,6 +752,7 @@ def daemon():
                     except OSError:
                         client.close()
                         client, devices, next_connect = None, [], now + 3
+                        room.active.clear()
                 plugged = hid
                 present = find_headsets()
                 for path in set(headsets) - set(present):
@@ -554,7 +766,27 @@ def daemon():
                         headsets.pop(path, None)
                 last_sent = 0.0
 
+            if not room_on or effect == "manual":
+                if room.active:
+                    room.stop(client)
+                elif now >= room.next_try:
+                    room.restore()
+            elif client is not None and not room.active and RoomSync.areas(devices):
+                try:
+                    room.start(client, devices, now)
+                except OSError:
+                    client.close()
+                    client, devices, next_connect = None, [], now + 3
+                    room.active.clear()
+
             status = make_status(effect, main, palette, devices + list(headsets.values()))
+            status["room"] = {
+                "enabled": room_on,
+                "available": bool(RoomSync.areas(devices)),
+                "active": bool(room.active),
+                "areas": [d.name for d in RoomSync.areas(devices)],
+                "error": room.error,
+            }
             if status != written:
                 written = status
                 write_status(status)
@@ -565,10 +797,13 @@ def daemon():
                 if client is not None:
                     try:
                         for device in devices:
+                            if device.room and device.index not in room.active:
+                                continue
                             client.update(device, frame(effect, device, t, main, palette))
                     except OSError:
                         client.close()
                         client, devices, next_connect = None, [], now + 3
+                        room.active.clear()
                 for path, headset in list(headsets.items()):
                     try:
                         headset.update(frame(effect, headset, t, main, palette))
@@ -580,6 +815,8 @@ def daemon():
     finally:
         for headset in headsets.values():
             headset.release()
+        # Nothing drives the room lights once the daemon is gone.
+        room.stop(client)
         if client is not None:
             client.close()
         try:
@@ -646,6 +883,10 @@ def main():
     elif args[0] == "effect" and len(args) == 2 and args[1] in EFFECTS:
         STATE.parent.mkdir(parents=True, exist_ok=True)
         STATE.write_text(args[1] + "\n")
+    elif args[0] == "room" and len(args) == 2 and args[1] in ("on", "off", "toggle"):
+        on = (not room_enabled()) if args[1] == "toggle" else args[1] == "on"
+        ROOM.parent.mkdir(parents=True, exist_ok=True)
+        ROOM.write_text("on\n" if on else "off\n")
     elif args == ["status"]:
         print_status()
     elif args == ["daemon"]:
