@@ -30,6 +30,7 @@ import signal
 import socket
 import struct
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -40,7 +41,7 @@ CLIENT_NAME = b"omarchy-rgb\0"
 THEME = Path.home() / ".local/state/omarchy/current/theme"
 STATE = Path.home() / ".local/state/omarchy/rgb-effect"
 STATUS = Path.home() / ".local/state/omarchy/rgb-status.json"
-LOCK = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-rgb.lock"
+LOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or STATE.parent) / "omarchy-rgb.lock"
 # static, pulse and wave follow the theme. manual leaves devices alone so
 # colors set in the OpenRGB app (or the devices' own lighting) stay; off is dark.
 EFFECTS = ("static", "pulse", "wave", "manual", "off")
@@ -458,7 +459,8 @@ def daemon_lock():
     holds it. Kept open for the daemon's lifetime; the kernel drops the lock
     when the process exits, however it exits."""
     LOCK.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(LOCK, "w")
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    lock = os.fdopen(fd, "r+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -611,9 +613,14 @@ def make_status(effect, main, palette, devices):
 
 def write_status(status):
     STATUS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATUS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(status))
-    tmp.replace(STATUS)
+    fd, tmp = tempfile.mkstemp(dir=STATUS.parent, prefix=".rgb-status.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(status))
+        os.replace(tmp, STATUS)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def print_status():

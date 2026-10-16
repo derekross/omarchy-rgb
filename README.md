@@ -32,6 +32,18 @@ link it onto your PATH:
 ln -s ~/.config/omarchy/plugins/derekross.rgb/bin/omarchy-rgb ~/.local/bin/
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove derekross.rgb
+```
+
+Removing the plugin stops the daemon and the OpenRGB server it started, and
+headsets get their own lighting back. If you linked `omarchy-rgb` onto your
+PATH, delete the link with `rm ~/.local/bin/omarchy-rgb`. The daemon's state
+is in `~/.local/state/omarchy/rgb-effect` and `rgb-status.json`, and you can
+delete those too. OpenRGB itself stays installed.
+
 ## Use
 
 Click the keyboard icon in the bar for the panel. Right-click turns the lights
