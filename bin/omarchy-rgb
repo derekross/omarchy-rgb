@@ -26,6 +26,7 @@ when sync turns off, since the lights keep the last streamed color otherwise.
 
 import colorsys
 import fcntl
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -51,6 +52,7 @@ STATE = Path.home() / ".local/state/omarchy/rgb-effect"
 STATUS = Path.home() / ".local/state/omarchy/rgb-status.json"
 ROOM = Path.home() / ".local/state/omarchy/rgb-room"
 ROOM_SNAPSHOT = Path.home() / ".local/state/omarchy/rgb-room-snapshot.json"
+BRIDGE_PIN = Path.home() / ".local/state/omarchy/rgb-hue-bridge.json"
 OPENRGB_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "OpenRGB/OpenRGB.json"
 LOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or STATE.parent) / "omarchy-rgb.lock"
 # static, pulse and wave follow the theme. manual leaves devices alone so
@@ -77,6 +79,10 @@ PKT_SET_CUSTOM_MODE = 1100
 PKT_UPDATE_MODE = 1101
 
 NO_LED = 0xFFFFFFFF
+# Largest packet accepted from the SDK server. A device's description with
+# thousands of LEDs is a few hundred KB; anything near this is refused rather
+# than read into memory.
+MAX_PACKET = 1 << 22
 
 # Room lights light the room, not the desk, so they're only driven while room
 # sync is on. Only Hue Entertainment areas, which stream; OpenRGB's per-bulb Hue
@@ -307,6 +313,8 @@ class Client:
         if header[:4] != b"ORGB":
             raise ConnectionError("bad packet from OpenRGB server")
         _, packet, size = struct.unpack("<III", header[4:])
+        if size > MAX_PACKET:
+            raise ConnectionError("oversized packet from OpenRGB server")
         data = self.read_exact(size)
         if packet == PKT_DEVICE_LIST_UPDATED:
             self.devices_changed = True
@@ -464,9 +472,10 @@ class HueBridge:
     """The Hue bridge OpenRGB is paired with, over its local REST API, to save
     the room lights' colors before streaming and put them back after.
 
-    The bridge serves HTTPS with a self-signed certificate, so it isn't
-    verified. OpenRGB itself talks to the bridge over plain HTTP with the same
-    key, so verifying here wouldn't keep the key any more private."""
+    Bridges serve HTTPS with a certificate no system CA signs, so it's pinned
+    on first use: its SHA-256 is saved to BRIDGE_PIN, tied to the bridge key,
+    and every later connection must present the same certificate before the
+    key is sent. Pairing OpenRGB with a new key starts a new pin."""
 
     def __init__(self):
         try:
@@ -478,13 +487,43 @@ class HueBridge:
             raise RoomError("No Hue bridge is paired in OpenRGB")
         if not isinstance(self.username, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", self.username):
             raise RoomError("The Hue bridge key in OpenRGB's settings is invalid")
+        # The certificate is checked against the pin in request(), before the
+        # key goes out, instead of against a CA.
         self.context = ssl.create_default_context()
         self.context.check_hostname = False
         self.context.verify_mode = ssl.CERT_NONE
+        self.key_id = hashlib.sha256(self.username.encode()).hexdigest()
+
+    def check_certificate(self, der):
+        fingerprint = hashlib.sha256(der).hexdigest()
+        try:
+            fd = os.open(BRIDGE_PIN, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd) as f:
+                pin = json.loads(f.read(4096))
+        except FileNotFoundError:
+            pin = None
+        except (OSError, ValueError) as e:
+            raise RoomError(f"Can't read the Hue bridge pin {BRIDGE_PIN}: {e}")
+        if isinstance(pin, dict) and pin.get("key") == self.key_id:
+            if pin.get("sha256") != fingerprint:
+                raise RoomError("The Hue bridge's certificate doesn't match the one pinned "
+                                f"when it was first used. If you replaced or reset the bridge, "
+                                f"pair it again in OpenRGB or delete {BRIDGE_PIN}")
+            return
+        # First use of this key, or OpenRGB was paired again: pin this bridge.
+        try:
+            write_private_json(BRIDGE_PIN, {"key": self.key_id, "sha256": fingerprint})
+        except OSError as e:
+            raise RoomError(f"Can't save the Hue bridge pin {BRIDGE_PIN}: {e}")
 
     def request(self, method, path, body=None):
         conn = http.client.HTTPSConnection(self.ip, 443, timeout=5, context=self.context)
         try:
+            conn.connect()
+            der = conn.sock.getpeercert(binary_form=True)
+            if not der:
+                raise RoomError("The Hue bridge sent no certificate")
+            self.check_certificate(der)
             conn.request(method, f"/api/{self.username}{path}",
                          body=None if body is None else json.dumps(body),
                          headers={"Content-Type": "application/json"})

@@ -114,9 +114,12 @@ because Hue lights otherwise keep the last streamed color. If the daemon
 stops unexpectedly, it puts the lights back the next time it starts.
 
 The daemon reads the bridge key from OpenRGB's settings and talks to the
-bridge over HTTPS without checking its self-signed certificate. OpenRGB
-already sends the same key over plain HTTP, so checking it wouldn't make the
-key any safer.
+bridge over HTTPS. No public authority signs a Hue bridge's certificate, so
+the first time a key is used the daemon saves the bridge's certificate
+fingerprint to `~/.local/state/omarchy/rgb-hue-bridge.json`, and from then on
+it sends the key only to a bridge presenting that same certificate. If you
+replace or reset the bridge, pair it again in OpenRGB (a new key starts a new
+pin) or delete that file.
 
 ## How it works
 
