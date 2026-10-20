@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "derekross.rgb",
   "name": "RGB",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Derek Ross",
   "license": "MIT",
   "description": "Theme-colored lighting for OpenRGB devices and Corsair VOID headsets: static, pulse or wave in your theme's colors, or hand control back to OpenRGB. Needs OpenRGB: omarchy pkg add openrgb.",
